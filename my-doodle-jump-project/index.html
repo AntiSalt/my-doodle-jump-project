@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>Doodle Jump</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #2c2c2c;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    canvas {
+      display: block;
+      border: 2px solid #888;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="420" height="680"></canvas>
+  <script>
+    'use strict';
+
+    // =====================================================
+    // 1. CONFIG — 所有常量集中管理
+    // =====================================================
+    const C = {
+      GRAVITY:          0.25,
+      JUMP_FORCE:      -11,
+      SPRING_FORCE:    -20,   // spring platform extra bounce
+      ROCKET_VEL:       -8,   // constant upward vel during rocket
+      ROCKET_DURATION:  180,  // frames (~3s)
+      SHIELD_DURATION:  480,  // frames (~8s)
+      POWERUP_CHANCE:   0.10, // prob of powerup above each new platform
+      MOVE_SPEED:       5,
+      CANVAS_W:         420,
+      CANVAS_H:         680,
+      PLATFORM_W:       70,
+      PLATFORM_H:       14,
+      PLATFORM_COUNT:   12,
+      PLATFORM_MIN:     10,
+      PLATFORM_MAX:     14,
+      PLATFORM_REFILL:  100,
+      MAX_GAP_INITIAL:  120,
+      MAX_GAP_FINAL:    180,
+      DIFFICULTY_CAP:   20000,
+      CAMERA_TRIGGER:   0.4,
+    };
+
+    // =====================================================
+    // 2. AudioManager — Web Audio API 合成音效（懒加载）
+    // =====================================================
+    class AudioManager {
+      constructor() {
+        this._ctx = null;
+      }
+
+      _init() {
+        if (!this._ctx) {
+          this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (this._ctx.state === 'suspended') {
+          this._ctx.resume();
+        }
+      }
+
+      _tone(freqStart, freqEnd, duration, gain = 0.25) {
+        this._init();
+        const ac = this._ctx;
+        const osc = ac.createOscillator();
+        const g   = ac.createGain();
+        osc.connect(g);
+        g.connect(ac.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freqStart, ac.currentTime);
+        osc.frequency.linearRampToValueAtTime(freqEnd, ac.currentTime + duration);
+        g.gain.setValueAtTime(gain, ac.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + duration);
+        osc.start(ac.currentTime);
+        osc.stop(ac.currentTime + duration);
+      }
+
+      playJump() {
+        this._tone(300, 600, 0.12);
+      }
+
+      playBreak() {
+        this._init();
+        const ac = this._ctx;
+        const bufSize = Math.floor(ac.sampleRate * 0.15);
+        const buf  = ac.createBuffer(1, bufSize, ac.sampleRate);
+        const data = buf.getChannelData(0);
+        for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+        const src = ac.createBufferSource();
+        const g   = ac.createGain();
+        src.buffer = buf;
+        src.connect(g);
+        g.connect(ac.destination);
+        g.gain.setValueAtTime(0.25, ac.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime + 0.15);
+        src.start();
+      }
+
+      playGameOver() {
+        this._tone(400, 150, 0.5, 0.3);
+      }
+
+      playMilestone() {
+        this._tone(800, 800, 0.1, 0.2);
+      }
+
+      playSpring()  { this._tone(400, 1000, 0.15, 0.35); }
+      playRocket()  { this._tone(180,  500, 0.30, 0.25); }
+      playShield()  { this._tone(600,  900, 0.15, 0.30); }
+    }
+
+    // =====================================================
+    // 3. DifficultyManager — 根据 cameraY 输出难度参数
+    // =====================================================
+    class DifficultyManager {
+      get(cameraY) {
+        const t = Math.min(Math.abs(Math.min(cameraY, 0)) / C.DIFFICULTY_CAP, 1);
+        const lerp = (a, b) => a + (b - a) * t;
+        return {
+          t,
+          normalRatio:    lerp(0.70, 0.35),
+          movingRatio:    lerp(0.20, 0.40),
+          breakableRatio: lerp(0.10, 0.25),
+          maxGap:         lerp(C.MAX_GAP_INITIAL, C.MAX_GAP_FINAL),
+          movingSpeed:    lerp(2.0, 5.0),
+          zone:           Math.floor(t * 10) + 1,
+        };
+      }
+    }
+
+    // =====================================================
+    // 4. Platform — 普通 / 移动 / 易碎 平台类
+    // =====================================================
+    class Platform {
+      constructor(x, worldY, type, speed = 2) {
+        this.x      = x;
+        this.worldY = worldY;
+        this.w      = C.PLATFORM_W;
+        this.h      = C.PLATFORM_H;
+        this.type   = type;
+        this.speed  = speed;
+        this.dir    = 1;
+        this.state  = 'alive';
+        this.alpha  = 1.0;
+      }
+
+      get left()  { return this.x; }
+      get right() { return this.x + this.w; }
+      get top()   { return this.worldY; }
+
+      update() {
+        if (this.type === 'moving' && this.state === 'alive') {
+          this.x += this.speed * this.dir;
+          if (this.x <= 0 || this.x + this.w >= C.CANVAS_W) {
+            this.dir *= -1;
+            this.x = Math.max(0, Math.min(C.CANVAS_W - this.w, this.x));
+          }
+        }
+        if (this.state === 'dying') {
+          this.alpha -= 0.05;
+        }
+      }
+
+      draw(ctx, cameraY) {
+        const screenY = this.worldY - cameraY;
+        if (screenY > C.CANVAS_H + 20 || screenY < -20) return;
+
+        ctx.save();
+        ctx.globalAlpha = this.alpha;
+
+        const colors = {
+          normal:    '#5a9e5a',
+          moving:    '#5a7ec8',
+          breakable: '#e8833a',
+          spring:    '#ddcc00',
+        };
+        ctx.fillStyle = colors[this.type] || '#5a9e5a';
+
+        const r = 6;
+        const x = this.x, y = screenY, w = this.w, h = this.h;
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + w - r, y);
+        ctx.arcTo(x + w, y,     x + w, y + r,     r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+        ctx.lineTo(x + r, y + h);
+        ctx.arcTo(x,     y + h, x,     y + h - r, r);
+        ctx.lineTo(x,    y + r);
+        ctx.arcTo(x,     y,     x + r, y,          r);
+        ctx.closePath();
+        ctx.fill();
+
+        if (this.type === 'moving') {
+          ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }
+
+        if (this.type === 'spring') {
+          // coil zigzag above platform centre
+          const cx = x + w / 2;
+          ctx.strokeStyle = '#997700';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.moveTo(cx - 7, y - 1);
+          ctx.lineTo(cx + 7, y - 5);
+          ctx.lineTo(cx - 7, y - 9);
+          ctx.lineTo(cx + 7, y - 13);
+          ctx.stroke();
+        }
+
+        ctx.restore();
+      }
+
+      checkCollision(player) {
+        if (this.state !== 'alive')              return false;
+        if (player.velocityY <= 0)               return false;
+        if (player.prevBottomY > this.worldY)    return false;
+        if (player.currentBottomY < this.worldY) return false;
+        if (player.worldX + 18 <= this.left)     return false;
+        if (player.worldX - 18 >= this.right)    return false;
+        return true;
+      }
+
+      onLand(shieldActive = false) {
+        if (this.type === 'breakable' && !shieldActive) {
+          this.state = 'dying';
+          this.alpha = 1.0;
+        }
+      }
+    }
+
+    // =====================================================
+    // 5. Player — 玩家类（物理 / 渲染 / 压缩拉伸动画）
+    // =====================================================
+    class Player {
+      constructor(worldX, worldY) {
+        this.worldX         = worldX;
+        this.worldY         = worldY;
+        this.velocityY      = 0;
+        this.prevBottomY    = worldY + 16;
+        this.currentBottomY = worldY + 16;
+        this.scaleX         = 1.0;
+        this.scaleY         = 1.0;
+        this.facingDir      = 1;
+      }
+
+      update(inputX) {
+        this.prevBottomY = this.worldY + 16;
+
+        this.velocityY += C.GRAVITY;
+        this.worldY    += this.velocityY;
+        this.currentBottomY = this.worldY + 16;
+
+        if (inputX !== 0) this.facingDir = inputX;
+        this.worldX += inputX * C.MOVE_SPEED;
+
+        if (this.worldX < -18)             this.worldX = C.CANVAS_W + 18;
+        if (this.worldX > C.CANVAS_W + 18) this.worldX = -18;
+
+        const targetScaleX = this.velocityY < -8 ? 0.8 : 1.0;
+        const targetScaleY = this.velocityY < -8 ? 1.3 : 1.0;
+        this.scaleX += (targetScaleX - this.scaleX) * 0.15;
+        this.scaleY += (targetScaleY - this.scaleY) * 0.15;
+        this.scaleX = Math.max(0.5, Math.min(1.5, this.scaleX));
+        this.scaleY = Math.max(0.5, Math.min(1.5, this.scaleY));
+      }
+
+      land(force = C.JUMP_FORCE) {
+        this.velocityY = force;
+        this.scaleX = 1.3;
+        this.scaleY = 0.7;
+      }
+
+      draw(ctx, cameraY) {
+        const S  = 4; // px per sprite pixel
+        const sx = Math.round(this.worldX);
+        const sy = Math.round(this.worldY - cameraY);
+
+        // Space Invader style alien: 10×9 grid
+        // 0=transparent  1=body(green)  2=eye(red)
+        const SP = [
+          [0,0,1,0,0,0,0,1,0,0],  // antennae
+          [0,0,1,0,0,0,0,1,0,0],  // antennae
+          [0,1,1,1,1,1,1,1,1,0],  // body top
+          [1,1,2,2,1,1,2,2,1,1],  // eyes (row 1)
+          [1,1,2,2,1,1,2,2,1,1],  // eyes (row 2)
+          [1,1,1,1,1,1,1,1,1,1],  // body
+          [1,0,1,1,0,0,1,1,0,1],  // crab bottom
+          [0,1,0,0,0,0,0,0,1,0],  // legs
+          [1,0,0,0,0,0,0,0,0,1],  // feet
+        ];
+
+        // body rows 0-6 = 28px; origin at body centre
+        const ox = -20; // -(10*S)/2
+        const oy = -14;
+        const es = this.facingDir; // eye-shine shift: -1 / 0 / 1
+
+        ctx.save();
+        ctx.translate(sx, sy);
+        ctx.scale(this.scaleX, this.scaleY);
+
+        // Draw all pixels
+        for (let r = 0; r < SP.length; r++) {
+          for (let c = 0; c < 10; c++) {
+            const v = SP[r][c];
+            if (v === 0) continue;
+            ctx.fillStyle = v === 1 ? '#44bb55' : '#ff4422';
+            ctx.fillRect(ox + c * S, oy + r * S, S, S);
+          }
+        }
+
+        // Eye shines: 2×2 white dot inside each eye, follows facing direction
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(ox + (2 + es) * S, oy + 3 * S, 2, 2);
+        ctx.fillRect(ox + (6 + es) * S, oy + 3 * S, 2, 2);
+
+        ctx.restore();
+      }
+    }
+
+    // =====================================================
+    // 5b. PowerUp — 道具类（火箭 / 护盾）
+    // =====================================================
+    class PowerUp {
+      constructor(x, baseY, type) {
+        this.x         = x;
+        this.baseY     = baseY;
+        this.type      = type;   // 'rocket' | 'shield'
+        this.collected = false;
+      }
+
+      draw(ctx, cameraY, frame) {
+        if (this.collected) return;
+        const screenY = this.baseY - cameraY + Math.sin(frame * 0.06) * 4;
+        if (screenY > C.CANVAS_H + 30 || screenY < -30) return;
+
+        ctx.save();
+        ctx.translate(this.x, screenY);
+
+        if (this.type === 'rocket') {
+          // body
+          ctx.fillStyle = '#ee5522';
+          ctx.fillRect(-5, -10, 10, 14);
+          // nose cone
+          ctx.fillStyle = '#ffcc00';
+          ctx.beginPath();
+          ctx.moveTo(-5, -10);
+          ctx.lineTo( 5, -10);
+          ctx.lineTo( 0, -18);
+          ctx.closePath();
+          ctx.fill();
+          // left fin
+          ctx.fillStyle = '#cc3300';
+          ctx.beginPath();
+          ctx.moveTo(-5,  0); ctx.lineTo(-10, 8); ctx.lineTo(-5, 4);
+          ctx.closePath(); ctx.fill();
+          // right fin
+          ctx.beginPath();
+          ctx.moveTo( 5,  0); ctx.lineTo( 10, 8); ctx.lineTo( 5, 4);
+          ctx.closePath(); ctx.fill();
+          // exhaust
+          ctx.fillStyle = '#ff9900';
+          ctx.fillRect(-3, 4, 6, 5);
+        } else {
+          // shield bubble
+          ctx.beginPath();
+          ctx.arc(0, 0, 12, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(68,170,255,0.30)';
+          ctx.fill();
+          ctx.strokeStyle = '#44aaff';
+          ctx.lineWidth = 2.5;
+          ctx.stroke();
+          // star inside
+          ctx.fillStyle = '#ffffff';
+          ctx.beginPath();
+          const pts = 5, r1 = 7, r2 = 3;
+          for (let i = 0; i < pts * 2; i++) {
+            const ang = (i * Math.PI) / pts - Math.PI / 2;
+            const rad = i % 2 === 0 ? r1 : r2;
+            i === 0 ? ctx.moveTo(Math.cos(ang)*rad, Math.sin(ang)*rad)
+                    : ctx.lineTo(Math.cos(ang)*rad, Math.sin(ang)*rad);
+          }
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        ctx.restore();
+      }
+
+      checkCollision(player) {
+        if (this.collected) return false;
+        return Math.abs(player.worldX - this.x)    < 22 &&
+               Math.abs(player.worldY - this.baseY) < 22;
+      }
+    }
+
+    // =====================================================
+    // 6. GameState — 全局状态变量
+    // =====================================================
+    const audio      = new AudioManager();
+    const difficulty = new DifficultyManager();
+
+    const canvas = document.getElementById('gameCanvas');
+    const ctx    = canvas.getContext('2d');
+
+    let gameState     = 'start';
+    let platforms     = [];
+    let player        = null;
+    let cameraY       = 0;
+    let score         = 0;
+    let highScore     = parseInt(localStorage.getItem('doodleHighScore') || '0', 10);
+    let inputX        = 0;
+    let frame         = 0;
+    let scoreScale    = 1.0;
+    let lastMilestone = 0;
+    let powerups      = [];
+    let rocketTimer   = 0;
+    let shieldTimer   = 0;
+
+    // =====================================================
+    // 7. Core Functions — init / spawnPlatform / update / render / gameLoop
+    // =====================================================
+
+    function pickType(diff) {
+      const r = Math.random();
+      if (r < 0.05) return 'spring';
+      const r2 = (r - 0.05) / 0.95;
+      if (r2 < diff.normalRatio) return 'normal';
+      if (r2 < diff.normalRatio + diff.movingRatio) return 'moving';
+      return 'breakable';
+    }
+
+    function init() {
+      cameraY       = 0;
+      score         = 0;
+      frame         = 0;
+      scoreScale    = 1.0;
+      lastMilestone = 0;
+      platforms     = [];
+      powerups      = [];
+      rocketTimer   = 0;
+      shieldTimer   = 0;
+
+      const diff = difficulty.get(0);
+
+      const p0x = C.CANVAS_W / 2 - C.PLATFORM_W / 2;
+      const p0y = C.CANVAS_H - 100;
+      platforms.push(new Platform(p0x, p0y, 'normal'));
+
+      let lastY = p0y;
+      for (let i = 1; i < C.PLATFORM_COUNT; i++) {
+        const gap  = 60 + Math.random() * (diff.maxGap - 60);
+        const y    = lastY - gap;
+        const x    = Math.random() * (C.CANVAS_W - C.PLATFORM_W);
+        const type = pickType(diff);
+        platforms.push(new Platform(x, y, type, diff.movingSpeed));
+        if (Math.random() < C.POWERUP_CHANCE) {
+          const puType = Math.random() < 0.5 ? 'rocket' : 'shield';
+          powerups.push(new PowerUp(x + C.PLATFORM_W / 2, y - 40, puType));
+        }
+        lastY = y;
+      }
+
+      player = new Player(C.CANVAS_W / 2, p0y - 40);
+      player.velocityY = C.JUMP_FORCE;
+    }
+
+    function spawnPlatform() {
+      const diff = difficulty.get(cameraY);
+      const minY = platforms.reduce((m, p) => Math.min(m, p.worldY), Infinity);
+      const gap  = 60 + Math.random() * (diff.maxGap - 60);
+      const y    = minY - gap;
+      const x    = Math.random() * (C.CANVAS_W - C.PLATFORM_W);
+      platforms.push(new Platform(x, y, pickType(diff), diff.movingSpeed));
+      if (Math.random() < C.POWERUP_CHANCE) {
+        const puType = Math.random() < 0.5 ? 'rocket' : 'shield';
+        powerups.push(new PowerUp(x + C.PLATFORM_W / 2, y - 40, puType));
+      }
+    }
+
+    function update() {
+      if (gameState !== 'playing') return;
+
+      for (const p of platforms) p.update();
+
+      player.update(inputX);
+
+      // Rocket thrust override
+      if (rocketTimer > 0) {
+        player.velocityY = C.ROCKET_VEL;
+        rocketTimer--;
+      }
+
+      // Shield timer countdown
+      if (shieldTimer > 0) shieldTimer--;
+
+      // Powerup collection
+      for (const pu of powerups) {
+        if (pu.checkCollision(player)) {
+          pu.collected = true;
+          if (pu.type === 'rocket') {
+            rocketTimer = C.ROCKET_DURATION;
+            audio.playRocket();
+          } else {
+            shieldTimer = C.SHIELD_DURATION;
+            audio.playShield();
+          }
+        }
+      }
+      powerups = powerups.filter(pu => !pu.collected && pu.baseY < cameraY + C.CANVAS_H + 50);
+
+      // Platform collision (skip while rocket active)
+      if (rocketTimer <= 0) {
+        for (const p of platforms) {
+          if (p.checkCollision(player)) {
+            player.land(p.type === 'spring' ? C.SPRING_FORCE : C.JUMP_FORCE);
+            p.onLand(shieldTimer > 0);
+            if (p.type === 'spring') {
+              audio.playSpring();
+            } else {
+              audio.playJump();
+              if (p.type === 'breakable') audio.playBreak();
+            }
+            break;
+          }
+        }
+      }
+
+      const triggerY = cameraY + C.CANVAS_H * C.CAMERA_TRIGGER;
+      if (player.worldY < triggerY) {
+        cameraY = player.worldY - C.CANVAS_H * C.CAMERA_TRIGGER;
+      }
+
+      const newScore = Math.max(score, Math.floor(Math.abs(Math.min(cameraY, 0)) / 50));
+      if (newScore > score) {
+        score = newScore;
+        scoreScale = 1.4;
+        if (Math.floor(score / 100) > Math.floor(lastMilestone / 100)) {
+          audio.playMilestone();
+          lastMilestone = score;
+        }
+      }
+      if (scoreScale > 1.0) scoreScale = Math.max(1.0, scoreScale * 0.9);
+
+      platforms = platforms.filter(p => {
+        if (p.state === 'dying' && p.alpha <= 0)    return false;
+        if (p.worldY > cameraY + C.CANVAS_H + 50)  return false;
+        return true;
+      });
+
+      const minY = platforms.reduce((m, p) => Math.min(m, p.worldY), Infinity);
+      if (minY > cameraY + C.PLATFORM_REFILL) {
+        while (platforms.length < C.PLATFORM_MAX) {
+          spawnPlatform();
+          const newMin = platforms.reduce((m, p) => Math.min(m, p.worldY), Infinity);
+          if (newMin <= cameraY + C.PLATFORM_REFILL) break;
+        }
+      }
+
+      if (player.worldY - cameraY > C.CANVAS_H + 50) {
+        if (shieldTimer > 0) {
+          // shield saves from death — bounce back
+          player.worldY    = cameraY + C.CANVAS_H - 60;
+          player.velocityY = C.JUMP_FORCE * 1.2;
+        } else {
+          if (score > highScore) {
+            highScore = score;
+            localStorage.setItem('doodleHighScore', String(highScore));
+          }
+          audio.playGameOver();
+          gameState = 'gameover';
+        }
+      }
+    }
+
+    function drawBackground() {
+      ctx.fillStyle = '#faf6f0';
+      ctx.fillRect(0, 0, C.CANVAS_W, C.CANVAS_H);
+      ctx.strokeStyle = 'rgba(0,0,0,0.04)';
+      ctx.lineWidth = 1;
+      const offset = ((cameraY % 20) + 20) % 20;
+      for (let y = offset; y < C.CANVAS_H; y += 20) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(C.CANVAS_W, y);
+        ctx.stroke();
+      }
+    }
+
+    function drawHUD() {
+      ctx.save();
+
+      // 暂停按钮（左上角 26×26，两条竖条图标）
+      ctx.fillStyle = 'rgba(0,0,0,0.18)';
+      ctx.beginPath();
+      const br = 4, bx = 8, by = 8, bw = 26, bh = 26;
+      ctx.moveTo(bx + br, by);
+      ctx.lineTo(bx + bw - br, by);
+      ctx.arcTo(bx + bw, by,      bx + bw, by + br,      br);
+      ctx.lineTo(bx + bw, by + bh - br);
+      ctx.arcTo(bx + bw, by + bh, bx + bw - br, by + bh, br);
+      ctx.lineTo(bx + br, by + bh);
+      ctx.arcTo(bx,      by + bh, bx,      by + bh - br, br);
+      ctx.lineTo(bx,     by + br);
+      ctx.arcTo(bx,      by,      bx + br, by,            br);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#444444';
+      ctx.fillRect(14, 13, 5, 16);
+      ctx.fillRect(23, 13, 5, 16);
+
+      // 分数 + 最高分合并显示（右上角，以右侧为锚点缩放）
+      ctx.save();
+      ctx.translate(C.CANVAS_W - 12, 22);
+      ctx.scale(scoreScale, scoreScale);
+      ctx.font      = "bold 15px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#333333';
+      ctx.textAlign = 'right';
+      ctx.fillText(`分数: ${score}`, 0, 0);
+      ctx.restore();
+      ctx.font      = "13px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#888888';
+      ctx.textAlign = 'right';
+      ctx.fillText(`最高: ${highScore}`, C.CANVAS_W - 12, 40);
+
+      // 区域指示（右下角）
+      const diff = difficulty.get(cameraY);
+      ctx.font      = "12px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#aaaaaa';
+      ctx.textAlign = 'right';
+      ctx.fillText(`区域 ${diff.zone}/10`, C.CANVAS_W - 12, C.CANVAS_H - 12);
+
+      // 道具计时器（左下角）
+      ctx.textAlign = 'left';
+      let timerY = C.CANVAS_H - 14;
+      if (shieldTimer > 0) {
+        ctx.font      = "bold 13px 'Comic Sans MS', cursive";
+        ctx.fillStyle = '#44aaff';
+        ctx.fillText(`盾 ${Math.ceil(shieldTimer / 60)}s`, 10, timerY);
+        timerY -= 20;
+      }
+      if (rocketTimer > 0) {
+        ctx.font      = "bold 13px 'Comic Sans MS', cursive";
+        ctx.fillStyle = '#ff6633';
+        ctx.fillText(`火箭 ${Math.ceil(rocketTimer / 60)}s`, 10, timerY);
+      }
+
+      ctx.restore();
+    }
+
+    function renderStart() {
+      drawBackground();
+      const demos = [[50, 500], [190, 400], [300, 320], [80, 240]];
+      const demoColors = ['#5a9e5a', '#5a7ec8', '#e8833a', '#5a9e5a'];
+      demos.forEach(([x, y], i) => {
+        ctx.fillStyle = demoColors[i];
+        const r = 6, w = C.PLATFORM_W, h = C.PLATFORM_H;
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + w - r, y);
+        ctx.arcTo(x + w, y,     x + w, y + r,     r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+        ctx.lineTo(x + r, y + h);
+        ctx.arcTo(x,     y + h, x,     y + h - r, r);
+        ctx.lineTo(x,    y + r);
+        ctx.arcTo(x,     y,     x + r, y,          r);
+        ctx.closePath();
+        ctx.fill();
+      });
+      const titleY = 200 + Math.sin(frame * 0.03) * 6;
+      ctx.textAlign  = 'center';
+      ctx.fillStyle  = '#d4522a';
+      ctx.font       = "bold 52px 'Comic Sans MS', cursive";
+      ctx.fillText('Doodle', C.CANVAS_W / 2, titleY);
+      ctx.fillText('Jump!',  C.CANVAS_W / 2, titleY + 60);
+      ctx.font      = "16px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#666';
+      ctx.fillText(`最高分: ${highScore}`, C.CANVAS_W / 2, titleY + 115);
+      ctx.globalAlpha = 0.5 + 0.5 * Math.sin(frame * 0.06);
+      ctx.font        = "17px 'Comic Sans MS', cursive";
+      ctx.fillStyle   = '#333';
+      ctx.fillText('按空格键或点击开始', C.CANVAS_W / 2, C.CANVAS_H - 70);
+      ctx.globalAlpha = 1;
+    }
+
+    function renderPlaying() {
+      drawBackground();
+      for (const p of platforms) p.draw(ctx, cameraY);
+      for (const pu of powerups) pu.draw(ctx, cameraY, frame);
+
+      // Rocket exhaust (behind player)
+      if (rocketTimer > 0) {
+        const sx = Math.round(player.worldX);
+        const sy = Math.round(player.worldY - cameraY);
+        ctx.save();
+        ctx.globalAlpha = 0.5 + 0.5 * Math.random();
+        ctx.fillStyle   = frame % 2 === 0 ? '#ff9900' : '#ffcc00';
+        ctx.fillRect(sx - 5, sy + 14, 10, 8 + Math.random() * 10);
+        ctx.restore();
+      }
+
+      player.draw(ctx, cameraY);
+
+      // Shield ring (in front of player)
+      if (shieldTimer > 0) {
+        const sx = Math.round(player.worldX);
+        const sy = Math.round(player.worldY - cameraY);
+        ctx.save();
+        ctx.strokeStyle = '#44aaff';
+        ctx.lineWidth   = 2.5;
+        ctx.globalAlpha = 0.35 + 0.35 * Math.abs(Math.sin(frame * 0.12));
+        ctx.beginPath();
+        ctx.arc(sx, sy, 28, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      drawHUD();
+    }
+
+    function renderGameOver() {
+      renderPlaying();
+      ctx.fillStyle = 'rgba(0,0,0,0.52)';
+      ctx.fillRect(0, 0, C.CANVAS_W, C.CANVAS_H);
+      ctx.textAlign = 'center';
+      ctx.font      = "bold 54px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('Game Over', C.CANVAS_W / 2, 260);
+      ctx.font      = "22px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#eeeeee';
+      ctx.fillText(`分数: ${score}`,       C.CANVAS_W / 2, 320);
+      ctx.fillText(`最高分: ${highScore}`, C.CANVAS_W / 2, 356);
+      ctx.globalAlpha = 0.5 + 0.5 * Math.sin(frame * 0.06);
+      ctx.font        = "16px 'Comic Sans MS', cursive";
+      ctx.fillStyle   = '#aaddff';
+      ctx.fillText('按空格键或点击返回主菜单', C.CANVAS_W / 2, 410);
+      ctx.globalAlpha = 1;
+      ctx.font      = "15px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#ffaa88';
+      ctx.fillText('按 R 键重新开始', C.CANVAS_W / 2, 440);
+    }
+
+    function renderPaused() {
+      renderPlaying();
+
+      // 半透明遮罩
+      ctx.fillStyle = 'rgba(0,0,0,0.50)';
+      ctx.fillRect(0, 0, C.CANVAS_W, C.CANVAS_H);
+
+      ctx.textAlign = 'center';
+
+      ctx.font      = "bold 52px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('暂停', C.CANVAS_W / 2, 250);
+
+      ctx.font      = "20px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#eeeeee';
+      ctx.fillText(`分数: ${score}`, C.CANVAS_W / 2, 310);
+      ctx.fillText(`最高分: ${highScore}`, C.CANVAS_W / 2, 344);
+
+      ctx.globalAlpha = 0.5 + 0.5 * Math.sin(frame * 0.06);
+      ctx.font        = "16px 'Comic Sans MS', cursive";
+      ctx.fillStyle   = '#aaddff';
+      ctx.fillText('按空格键或点击继续', C.CANVAS_W / 2, 405);
+      ctx.globalAlpha = 1;
+
+      ctx.font      = "15px 'Comic Sans MS', cursive";
+      ctx.fillStyle = '#ffaa88';
+      ctx.fillText('按 R 键重新开始', C.CANVAS_W / 2, 435);
+    }
+
+    function render() {
+      if      (gameState === 'start')    renderStart();
+      else if (gameState === 'playing')  renderPlaying();
+      else if (gameState === 'paused')   renderPaused();
+      else if (gameState === 'gameover') renderGameOver();
+    }
+
+    function gameLoop() {
+      frame++;
+      update();
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+
+    // =====================================================
+    // 8. Input — 键盘与 Canvas 点击事件
+    // =====================================================
+    document.addEventListener('keydown', e => {
+      if (e.code === 'ArrowLeft'  || e.code === 'KeyA') inputX = -1;
+      if (e.code === 'ArrowRight' || e.code === 'KeyD') inputX =  1;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (gameState === 'start') {
+          init();
+          gameState = 'playing';
+        } else if (gameState === 'gameover') {
+          gameState = 'start';
+        } else if (gameState === 'paused') {
+          gameState = 'playing';
+        }
+      }
+      if (e.code === 'Escape') {
+        if (gameState === 'playing') gameState = 'paused';
+        else if (gameState === 'paused') gameState = 'playing';
+      }
+      if (e.code === 'KeyR') {
+        if (gameState === 'paused' || gameState === 'playing' || gameState === 'gameover') {
+          init();
+          gameState = 'playing';
+        }
+      }
+    });
+
+    document.addEventListener('keyup', e => {
+      if (['ArrowLeft', 'KeyA', 'ArrowRight', 'KeyD'].includes(e.code)) {
+        inputX = 0;
+      }
+    });
+
+    canvas.addEventListener('click', e => {
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const onPauseBtn = mx >= 8 && mx <= 34 && my >= 8 && my <= 34;
+
+      if (gameState === 'playing' && onPauseBtn) {
+        gameState = 'paused';
+      } else if (gameState === 'paused') {
+        gameState = 'playing';
+      } else if (gameState === 'start') {
+        init();
+        gameState = 'playing';
+      } else if (gameState === 'gameover') {
+        gameState = 'start';
+      }
+    });
+
+    // =====================================================
+    // 9. Bootstrap — 启动入口
+    // =====================================================
+    gameLoop();
+
+  </script>
+</body>
+</html>
